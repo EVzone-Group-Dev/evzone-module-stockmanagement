@@ -27,6 +27,7 @@
         <javaCompilerVersion>1.8</javaCompilerVersion>
         <webservicesRestVersion>3.0.0</webservicesRestVersion>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <evzoneSaasAdminVersion>1.0.0-SNAPSHOT</evzoneSaasAdminVersion>
     </properties>
 
     <dependencyManagement>

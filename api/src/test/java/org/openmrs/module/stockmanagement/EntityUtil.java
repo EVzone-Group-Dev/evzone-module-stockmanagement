@@ -110,18 +110,11 @@ public class EntityUtil {
 	}
 	
 	public Object getRandomEnum(Class classType) {
-		Field f = null;
-		try {
-			f = classType.getDeclaredField("$VALUES");
-			
-			f.setAccessible(true);
-			Object o = f.get(null);
-			Object[] list = (Object[]) o;
-			return list[random.nextInt(list.length - 1)];
-		}
-		catch (Exception e) {
+		Object[] enumConstants = classType == null ? null : classType.getEnumConstants();
+		if (enumConstants == null || enumConstants.length == 0) {
 			throw new RuntimeException();
 		}
+		return enumConstants[random.nextInt(enumConstants.length)];
 	}
 	
 	public void setProperty(Object object, String field, Object value) {

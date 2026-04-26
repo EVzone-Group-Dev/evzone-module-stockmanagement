@@ -42,16 +42,22 @@ import org.openmrs.util.OpenmrsConstants;
 import org.springframework.util.Assert;
 
 import javax.mail.Session;
+import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.function.Function;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class StockManagementServiceImpl extends BaseOpenmrsService implements StockManagementService {
 
+    private static final String SOURCE_APP = "stockmanagement-api";
+
     StockManagementDao dao;
+
+    private Consumer<AuditEventData> auditEventConsumer;
 
     private Log log = LogFactory.getLog(this.getClass());
 
@@ -68,6 +74,10 @@ public class StockManagementServiceImpl extends BaseOpenmrsService implements St
      */
     public void setDao(StockManagementDao dao) {
         this.dao = dao;
+    }
+
+    public void setAuditEventConsumer(Consumer<AuditEventData> auditEventConsumer) {
+        this.auditEventConsumer = auditEventConsumer;
     }
 
     @Override
@@ -1643,7 +1653,7 @@ public class StockManagementServiceImpl extends BaseOpenmrsService implements St
 
         List<String> errors = new ArrayList<>();
 
-        boolean uomPriorityIsBigToSmall = GlobalProperties.uomPriorityIsBigToSmall();
+        boolean uomPriorityIsBigToSmall = resolveUomPriorityIsBigToSmall();
 
         for (StockItemInventorySearchFilter.ItemGroupFilter itemGroupFilter : itemsToSearch) {
 
@@ -1742,7 +1752,7 @@ public class StockManagementServiceImpl extends BaseOpenmrsService implements St
         StockItemInventorySearchFilter searchFilter = new StockItemInventorySearchFilter();
         searchFilter.setItemGroupFilters(itemsToSearch);
         List<StockItemInventory> stockItemInventories = dao.getStockItemInventory(searchFilter, null).getData();
-        boolean uomPriorityIsBigToSmall = GlobalProperties.uomPriorityIsBigToSmall();
+        boolean uomPriorityIsBigToSmall = resolveUomPriorityIsBigToSmall();
         List<ReservedTransaction> reservedTransactions = new ArrayList<ReservedTransaction>();
         for (StockItemInventorySearchFilter.ItemGroupFilter itemGroupFilter : itemsToSearch) {
 
@@ -2109,7 +2119,7 @@ public class StockManagementServiceImpl extends BaseOpenmrsService implements St
         Map<Integer, Order> orderMap = new HashMap<>();
         Map<Integer, Encounter> encounterMap = new HashMap<>();
         Map<String, Location> locationMap = new HashMap<>();
-        boolean uomPriorityIsBigToSmall = GlobalProperties.uomPriorityIsBigToSmall();
+        boolean uomPriorityIsBigToSmall = resolveUomPriorityIsBigToSmall();
         List<DispenseRequestProcessingInfo> processingInformation = new ArrayList<>();
 
         for (DispenseRequest dispenseRequest : dispenseRequests) {
@@ -2374,9 +2384,568 @@ public class StockManagementServiceImpl extends BaseOpenmrsService implements St
                         stockItemTransaction.setEncounter(item.getEncounter());
                     }
                     dao.saveStockItemTransaction(stockItemTransaction);
+                    recordMedicationDispense(item, stockItemTransaction);
 
                 }
             }
+        }
+    }
+
+    private void recordMedicationDispense(DispenseRequestProcessingInfo item, StockItemTransaction transaction) {
+        if (item == null || transaction == null || item.getPatient() == null || StringUtils.isBlank(item.getPatient().getUuid())) {
+            return;
+        }
+
+        List<AuditContextItemData> contextItems = buildCommonContext();
+        addContextItem(contextItems, "patientUuid", item.getPatient().getUuid());
+        addContextItem(contextItems, "orderUuid", item.getOrder() == null ? null : item.getOrder().getUuid());
+        addContextItem(contextItems, "encounterUuid", item.getEncounter() == null ? null : item.getEncounter().getUuid());
+        addContextItem(contextItems, "stockItemUuid", item.getStockItem() == null ? null : item.getStockItem().getUuid());
+        addContextItem(contextItems, "stockBatchUuid", item.getStockBatch() == null ? null : item.getStockBatch().getUuid());
+        addContextItem(contextItems, "dispensingLocationUuid", item.getLocation() == null ? null : item.getLocation().getUuid());
+        addContextItem(contextItems, "packagingUomUuid",
+                item.getPackagingUOM() == null ? null : item.getPackagingUOM().getUuid());
+        addContextItem(contextItems, "quantity", item.getQuantity() == null ? null : item.getQuantity().toPlainString());
+
+        recordEvent("MEDICATION_DISPENSED", "PATIENT_WRITE", "STOCK_ITEM_TRANSACTION",
+                firstNonBlank(transaction.getUuid(),
+                        item.getStockItem() == null ? null : item.getStockItem().getUuid()),
+                "Dispensed medication from stock.", contextItems);
+    }
+
+    private void recordPatientOrderItemsView(List<OrderItem> orderItems, String accessPattern, String message) {
+        if (orderItems == null || orderItems.isEmpty()) {
+            return;
+        }
+
+        Map<String, Integer> resultCountsByPatient = new LinkedHashMap<String, Integer>();
+        Set<String> orderUuids = new LinkedHashSet<String>();
+        Set<String> encounterUuids = new LinkedHashSet<String>();
+        Set<String> stockItemUuids = new LinkedHashSet<String>();
+
+        for (OrderItem orderItem : orderItems) {
+            if (orderItem == null) {
+                continue;
+            }
+
+            Order order = orderItem.getOrder();
+            Patient patient = order == null ? null : order.getPatient();
+            if (patient != null && StringUtils.isNotBlank(patient.getUuid())) {
+                Integer count = resultCountsByPatient.get(patient.getUuid());
+                resultCountsByPatient.put(patient.getUuid(), count == null ? 1 : count + 1);
+            }
+
+            if (order != null && StringUtils.isNotBlank(order.getUuid())) {
+                orderUuids.add(order.getUuid());
+            }
+            if (order != null && order.getEncounter() != null && StringUtils.isNotBlank(order.getEncounter().getUuid())) {
+                encounterUuids.add(order.getEncounter().getUuid());
+            }
+            if (orderItem.getStockItem() != null && StringUtils.isNotBlank(orderItem.getStockItem().getUuid())) {
+                stockItemUuids.add(orderItem.getStockItem().getUuid());
+            }
+        }
+
+        for (Map.Entry<String, Integer> patientEntry : resultCountsByPatient.entrySet()) {
+            recordPatientReadEvent(patientEntry.getKey(), patientEntry.getValue(), "PATIENT_ORDER_ITEMS", message,
+                    accessPattern, orderUuids, encounterUuids, stockItemUuids, null);
+        }
+    }
+
+    private void recordPatientOrderItemSearchView(Result<OrderItemDTO> result, String accessPattern, String message) {
+        if (result == null || result.getData() == null || result.getData().isEmpty()) {
+            return;
+        }
+
+        Set<Integer> patientIds = new LinkedHashSet<Integer>();
+        Set<String> orderUuids = new LinkedHashSet<String>();
+        Set<String> encounterUuids = new LinkedHashSet<String>();
+        Set<String> stockItemUuids = new LinkedHashSet<String>();
+
+        for (OrderItemDTO orderItem : result.getData()) {
+            if (orderItem == null) {
+                continue;
+            }
+
+            if (orderItem.getPatientId() != null) {
+                patientIds.add(orderItem.getPatientId());
+            }
+            if (StringUtils.isNotBlank(orderItem.getOrderUuid())) {
+                orderUuids.add(orderItem.getOrderUuid());
+            }
+            if (StringUtils.isNotBlank(orderItem.getEncounterUuid())) {
+                encounterUuids.add(orderItem.getEncounterUuid());
+            }
+            if (StringUtils.isNotBlank(orderItem.getStockItemUuid())) {
+                stockItemUuids.add(orderItem.getStockItemUuid());
+            }
+        }
+
+        Map<Integer, String> patientUuidsById = resolvePatientUuids(patientIds);
+        Map<String, Integer> resultCountsByPatient = new LinkedHashMap<String, Integer>();
+
+        for (OrderItemDTO orderItem : result.getData()) {
+            if (orderItem == null || orderItem.getPatientId() == null) {
+                continue;
+            }
+
+            String patientUuid = patientUuidsById.get(orderItem.getPatientId());
+            if (StringUtils.isBlank(patientUuid)) {
+                continue;
+            }
+
+            Integer count = resultCountsByPatient.get(patientUuid);
+            resultCountsByPatient.put(patientUuid, count == null ? 1 : count + 1);
+        }
+
+        for (Map.Entry<String, Integer> patientEntry : resultCountsByPatient.entrySet()) {
+            recordPatientReadEvent(patientEntry.getKey(), patientEntry.getValue(), "PATIENT_ORDER_ITEMS", message,
+                    accessPattern, orderUuids, encounterUuids, stockItemUuids, null);
+        }
+    }
+
+    private void recordPatientStockTransactionView(Result<StockItemTransactionDTO> result, String message) {
+        if (result == null || result.getData() == null || result.getData().isEmpty()) {
+            return;
+        }
+
+        Map<String, Integer> resultCountsByPatient = new LinkedHashMap<String, Integer>();
+        Set<String> stockItemUuids = new LinkedHashSet<String>();
+        Set<String> stockBatchUuids = new LinkedHashSet<String>();
+        Set<String> orderIds = new LinkedHashSet<String>();
+        Set<String> encounterIds = new LinkedHashSet<String>();
+
+        for (StockItemTransactionDTO transaction : result.getData()) {
+            if (transaction == null || StringUtils.isBlank(transaction.getPatientUuid())) {
+                continue;
+            }
+
+            Integer count = resultCountsByPatient.get(transaction.getPatientUuid());
+            resultCountsByPatient.put(transaction.getPatientUuid(), count == null ? 1 : count + 1);
+
+            if (StringUtils.isNotBlank(transaction.getStockItemUuid())) {
+                stockItemUuids.add(transaction.getStockItemUuid());
+            }
+            if (StringUtils.isNotBlank(transaction.getStockBatchUuid())) {
+                stockBatchUuids.add(transaction.getStockBatchUuid());
+            }
+            if (transaction.getOrderId() != null) {
+                orderIds.add(Integer.toString(transaction.getOrderId()));
+            }
+            if (transaction.getEncounterId() != null) {
+                encounterIds.add(Integer.toString(transaction.getEncounterId()));
+            }
+        }
+
+        for (Map.Entry<String, Integer> patientEntry : resultCountsByPatient.entrySet()) {
+            List<AuditContextItemData> extraContext = new ArrayList<AuditContextItemData>();
+            addContextItem(extraContext, "stockBatchUuid", getSingleValue(stockBatchUuids));
+            addContextItem(extraContext,
+                    "stockBatchCount", stockBatchUuids.size() > 1 ? Integer.toString(stockBatchUuids.size()) : null);
+            addContextItem(extraContext, "orderId", getSingleValue(orderIds));
+            addContextItem(extraContext, "orderCount", orderIds.size() > 1 ? Integer.toString(orderIds.size()) : null);
+            addContextItem(extraContext, "encounterId", getSingleValue(encounterIds));
+            addContextItem(extraContext,
+                    "encounterCount", encounterIds.size() > 1 ? Integer.toString(encounterIds.size()) : null);
+            recordPatientReadEvent(patientEntry.getKey(), patientEntry.getValue(), "PATIENT_STOCK_TRANSACTIONS",
+                    message, "patient-transaction-history", Collections.<String>emptySet(),
+                    Collections.<String>emptySet(), stockItemUuids, extraContext);
+        }
+    }
+
+    private void recordPatientReadEvent(String patientUuid, int resultCount, String targetType, String message,
+            String accessPattern, Collection<String> orderUuids, Collection<String> encounterUuids,
+            Collection<String> stockItemUuids, List<AuditContextItemData> extraContextItems) {
+        if (StringUtils.isBlank(patientUuid)) {
+            return;
+        }
+
+        List<AuditContextItemData> contextItems = buildCommonContext();
+        addContextItem(contextItems, "patientUuid", patientUuid);
+        addContextItem(contextItems, "resultCount", Integer.toString(resultCount));
+        addContextItem(contextItems, "accessPattern", accessPattern);
+        addContextItem(contextItems, "orderUuid", getSingleValue(orderUuids));
+        addContextItem(contextItems,
+                "orderCount", orderUuids != null && orderUuids.size() > 1 ? Integer.toString(orderUuids.size()) : null);
+        addContextItem(contextItems, "encounterUuid", getSingleValue(encounterUuids));
+        addContextItem(contextItems, "encounterCount",
+                encounterUuids != null && encounterUuids.size() > 1 ? Integer.toString(encounterUuids.size()) : null);
+        addContextItem(contextItems, "stockItemUuid", getSingleValue(stockItemUuids));
+        addContextItem(contextItems, "stockItemCount",
+                stockItemUuids != null && stockItemUuids.size() > 1 ? Integer.toString(stockItemUuids.size()) : null);
+        if (extraContextItems != null && !extraContextItems.isEmpty()) {
+            contextItems.addAll(extraContextItems);
+        }
+
+        recordEvent("PATIENT_CHART_VIEWED", "PATIENT_READ", targetType, patientUuid, message, contextItems);
+    }
+
+    private boolean shouldAuditOrderItemSearch(OrderItemSearchFilter filter) {
+        return filter != null && (!isEmpty(filter.getPatientIds()) || !isEmpty(filter.getEncounterIds())
+                || !isEmpty(filter.getEncounterUuids()) || !isEmpty(filter.getOrderIds())
+                || !isEmpty(filter.getOrderUuids()) || StringUtils.isNotBlank(filter.getOrderNumber()));
+    }
+
+    private String resolveOrderItemAccessPattern(OrderItemSearchFilter filter) {
+        if (filter == null) {
+            return "order-search";
+        }
+        if (!isEmpty(filter.getPatientIds())) {
+            return "patient-search";
+        }
+        if (!isEmpty(filter.getEncounterIds()) || !isEmpty(filter.getEncounterUuids())) {
+            return "encounter-search";
+        }
+        if (!isEmpty(filter.getOrderIds()) || !isEmpty(filter.getOrderUuids()) || StringUtils.isNotBlank(filter.getOrderNumber())) {
+            return "order-search";
+        }
+        return "order-search";
+    }
+
+    private Map<Integer, String> resolvePatientUuids(Collection<Integer> patientIds) {
+        Map<Integer, String> patientUuidsById = new LinkedHashMap<Integer, String>();
+        if (patientIds == null || patientIds.isEmpty()) {
+            return patientUuidsById;
+        }
+
+        for (Integer patientId : patientIds) {
+            if (patientId == null) {
+                continue;
+            }
+
+            Patient patient = Context.getPatientService().getPatient(patientId);
+            if (patient != null && StringUtils.isNotBlank(patient.getUuid())) {
+                patientUuidsById.put(patientId, patient.getUuid());
+            }
+        }
+
+        return patientUuidsById;
+    }
+
+    private boolean isEmpty(Collection<?> values) {
+        return values == null || values.isEmpty();
+    }
+
+    private String getSingleValue(Collection<String> values) {
+        if (values == null || values.size() != 1) {
+            return null;
+        }
+        return values.iterator().next();
+    }
+
+    private boolean resolveUomPriorityIsBigToSmall() {
+        try {
+            return GlobalProperties.uomPriorityIsBigToSmall();
+        }
+        catch (NoClassDefFoundError ignored) {
+            return true;
+        }
+    }
+
+    private void recordEvent(String eventCode, String category, String targetType, String targetId, String message,
+            List<AuditContextItemData> contextItems) {
+        AuditEventData auditEvent = new AuditEventData();
+        auditEvent.setEventCode(eventCode);
+        auditEvent.setCategory(category);
+        auditEvent.setTenantKey(resolveTenantKey());
+        auditEvent.setUsername(resolveUsername());
+        auditEvent.setSourceApp(SOURCE_APP);
+        auditEvent.setActionStatus("SUCCESS");
+        auditEvent.setTargetType(targetType);
+        auditEvent.setTargetId(targetId);
+        auditEvent.setMessage(message);
+        auditEvent.setEventDateTime(new Date());
+        auditEvent.setContextItems(Collections.unmodifiableList(new ArrayList<AuditContextItemData>(contextItems)));
+        publishAuditEvent(auditEvent);
+    }
+
+    private void publishAuditEvent(AuditEventData auditEvent) {
+        if (auditEvent == null) {
+            return;
+        }
+
+        if (auditEventConsumer != null) {
+            auditEventConsumer.accept(auditEvent);
+            return;
+        }
+
+        try {
+            Object service = Context.getRegisteredComponent("evzonesaasadmin.auditLogService", Object.class);
+            if (service == null) {
+                return;
+            }
+
+            Method recordMethod = findMethod(service.getClass(), "recordEvent");
+            if (recordMethod == null || recordMethod.getParameterTypes().length != 1) {
+                return;
+            }
+
+            Class<?> entryClass = recordMethod.getParameterTypes()[0];
+            Object entry = entryClass.getDeclaredConstructor().newInstance();
+            invokeSetter(entry, "setEventCode", auditEvent.getEventCode());
+            invokeSetter(entry, "setCategory", auditEvent.getCategory());
+            invokeSetter(entry, "setTenantKey", auditEvent.getTenantKey());
+            invokeSetter(entry, "setUsername", auditEvent.getUsername());
+            invokeSetter(entry, "setSourceApp", auditEvent.getSourceApp());
+            invokeSetter(entry, "setActionStatus", auditEvent.getActionStatus());
+            invokeSetter(entry, "setTargetType", auditEvent.getTargetType());
+            invokeSetter(entry, "setTargetId", auditEvent.getTargetId());
+            invokeSetter(entry, "setMessage", auditEvent.getMessage());
+            invokeSetter(entry, "setEventDateTime", auditEvent.getEventDateTime());
+            invokeSetter(entry, "setContextItems", buildExternalContextItems(entryClass.getClassLoader(),
+                    auditEvent.getContextItems()));
+            recordMethod.invoke(service, entry);
+        }
+        catch (Exception ignored) {
+            // Audit logging must not block dispensing when the SaaS audit module is unavailable.
+        }
+    }
+
+    private List<AuditContextItemData> buildCommonContext() {
+        List<AuditContextItemData> contextItems = new ArrayList<AuditContextItemData>();
+        String tenantKey = resolveTenantKey();
+        String tenantNamespace = resolveTenantNamespace(tenantKey);
+        User authenticatedUser = resolveAuthenticatedUser();
+        Date eventTime = new Date();
+
+        addContextItem(contextItems, "tenantKey", tenantKey);
+        addContextItem(contextItems, "tenantNamespace", tenantNamespace);
+        addContextItem(contextItems, "userUuid", authenticatedUser == null ? null : authenticatedUser.getUuid());
+        addContextItem(contextItems, "username", resolveUsername(authenticatedUser));
+        addContextItem(contextItems, "sourceApp", SOURCE_APP);
+        addContextItem(contextItems, "eventTimestamp", Long.toString(eventTime.getTime()));
+        addContextItem(contextItems, "actionStatus", "SUCCESS");
+        return contextItems;
+    }
+
+    private void addContextItem(List<AuditContextItemData> contextItems, String key, String value) {
+        if (StringUtils.isBlank(key) || StringUtils.isBlank(value)) {
+            return;
+        }
+
+        AuditContextItemData contextItem = new AuditContextItemData();
+        contextItem.setKey(key);
+        contextItem.setValue(value);
+        contextItems.add(contextItem);
+    }
+
+    private List<Object> buildExternalContextItems(ClassLoader classLoader, List<AuditContextItemData> contextItems)
+            throws Exception {
+        if (contextItems == null || contextItems.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        Class<?> contextItemClass = Class.forName("org.openmrs.module.evzonesaasadmin.api.model.AuditLogContextItem",
+                true, classLoader);
+        List<Object> externalContextItems = new ArrayList<Object>();
+        for (AuditContextItemData contextItem : contextItems) {
+            Object externalContextItem = contextItemClass.getDeclaredConstructor().newInstance();
+            invokeSetter(externalContextItem, "setKey", contextItem.getKey());
+            invokeSetter(externalContextItem, "setValue", contextItem.getValue());
+            externalContextItems.add(externalContextItem);
+        }
+        return Collections.unmodifiableList(externalContextItems);
+    }
+
+    private Method findMethod(Class<?> type, String methodName) {
+        for (Method method : type.getMethods()) {
+            if (method.getName().equals(methodName)) {
+                return method;
+            }
+        }
+        return null;
+    }
+
+    private void invokeSetter(Object target, String methodName, Object value) throws Exception {
+        if (target == null || value == null) {
+            return;
+        }
+
+        Method setter = findMethod(target.getClass(), methodName);
+        if (setter != null && setter.getParameterTypes().length == 1) {
+            setter.invoke(target, value);
+        }
+    }
+
+    private String resolveTenantKey() {
+        return firstNonBlank(System.getenv("EVZONE_TENANT_SLUG"), System.getProperty("EVZONE_TENANT_SLUG"),
+                System.getProperty("evzone.tenant.slug"));
+    }
+
+    private String resolveTenantNamespace(String tenantKey) {
+        String tenantNamespace = firstNonBlank(System.getenv("EVZONE_TENANT_NAMESPACE"),
+                System.getProperty("EVZONE_TENANT_NAMESPACE"), System.getProperty("evzone.tenant.namespace"));
+        if (StringUtils.isNotBlank(tenantNamespace)) {
+            return tenantNamespace;
+        }
+        if (StringUtils.isBlank(tenantKey)) {
+            return null;
+        }
+        return "evzone-" + tenantKey;
+    }
+
+    private User resolveAuthenticatedUser() {
+        try {
+            return Context.getAuthenticatedUser();
+        }
+        catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private String resolveUsername() {
+        return resolveUsername(resolveAuthenticatedUser());
+    }
+
+    private String resolveUsername(User authenticatedUser) {
+        if (authenticatedUser != null && StringUtils.isNotBlank(authenticatedUser.getUsername())) {
+            return authenticatedUser.getUsername();
+        }
+        return "system";
+    }
+
+    private String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (StringUtils.isNotBlank(value)) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    public static class AuditEventData {
+
+        private String eventCode;
+
+        private String category;
+
+        private String tenantKey;
+
+        private String username;
+
+        private String sourceApp;
+
+        private String actionStatus;
+
+        private String targetType;
+
+        private String targetId;
+
+        private String message;
+
+        private Date eventDateTime;
+
+        private List<AuditContextItemData> contextItems;
+
+        public String getEventCode() {
+            return eventCode;
+        }
+
+        public void setEventCode(String eventCode) {
+            this.eventCode = eventCode;
+        }
+
+        public String getCategory() {
+            return category;
+        }
+
+        public void setCategory(String category) {
+            this.category = category;
+        }
+
+        public String getTenantKey() {
+            return tenantKey;
+        }
+
+        public void setTenantKey(String tenantKey) {
+            this.tenantKey = tenantKey;
+        }
+
+        public String getUsername() {
+            return username;
+        }
+
+        public void setUsername(String username) {
+            this.username = username;
+        }
+
+        public String getSourceApp() {
+            return sourceApp;
+        }
+
+        public void setSourceApp(String sourceApp) {
+            this.sourceApp = sourceApp;
+        }
+
+        public String getActionStatus() {
+            return actionStatus;
+        }
+
+        public void setActionStatus(String actionStatus) {
+            this.actionStatus = actionStatus;
+        }
+
+        public String getTargetType() {
+            return targetType;
+        }
+
+        public void setTargetType(String targetType) {
+            this.targetType = targetType;
+        }
+
+        public String getTargetId() {
+            return targetId;
+        }
+
+        public void setTargetId(String targetId) {
+            this.targetId = targetId;
+        }
+
+        public String getMessage() {
+            return message;
+        }
+
+        public void setMessage(String message) {
+            this.message = message;
+        }
+
+        public Date getEventDateTime() {
+            return eventDateTime;
+        }
+
+        public void setEventDateTime(Date eventDateTime) {
+            this.eventDateTime = eventDateTime;
+        }
+
+        public List<AuditContextItemData> getContextItems() {
+            return contextItems;
+        }
+
+        public void setContextItems(List<AuditContextItemData> contextItems) {
+            this.contextItems = contextItems;
+        }
+    }
+
+    public static class AuditContextItemData {
+
+        private String key;
+
+        private String value;
+
+        public String getKey() {
+            return key;
+        }
+
+        public void setKey(String key) {
+            this.key = key;
+        }
+
+        public String getValue() {
+            return value;
+        }
+
+        public void setValue(String value) {
+            this.value = value;
         }
     }
 
@@ -2391,7 +2960,7 @@ public class StockManagementServiceImpl extends BaseOpenmrsService implements St
             uomFilter.setStockItemIds(result.stream().map(p -> p.getStockItemId()).filter(p -> p != null).collect(Collectors.toList()));
             Map<Integer, List<StockItemPackagingUOMDTO>> uoms = findStockItemPackagingUOMs(uomFilter).getData().stream().collect(Collectors.groupingBy(StockItemPackagingUOMDTO::getStockItemId));
             if (!uoms.isEmpty()) {
-                boolean uomPriorityIsBigToSmall = GlobalProperties.uomPriorityIsBigToSmall();
+                boolean uomPriorityIsBigToSmall = resolveUomPriorityIsBigToSmall();
                 for (Map.Entry<Integer, List<StockItemPackagingUOMDTO>> entry : uoms.entrySet()) {
                     for (StockItemInventory stockItemInventory : result.stream().filter(p -> p.getStockItemId().equals(entry.getKey())).collect(Collectors.toList())) {
                         List<StockItemPackagingUOMDTO> uomList = entry.getValue();
@@ -2503,7 +3072,7 @@ public class StockManagementServiceImpl extends BaseOpenmrsService implements St
             }
 
             if (filter.getDoSetQuantityUoM()) {
-                boolean uomPriorityIsBigToSmall = GlobalProperties.uomPriorityIsBigToSmall();
+                boolean uomPriorityIsBigToSmall = resolveUomPriorityIsBigToSmall();
                 StockItemPackagingUOMSearchFilter uomFilter = new StockItemPackagingUOMSearchFilter();
                 uomFilter.setStockItemIds(result.getData().stream().map(p -> p.getStockItemId()).filter(p -> p != null).collect(Collectors.toList()));
                 if (filter.dispensing()) {
@@ -2559,6 +3128,9 @@ public class StockManagementServiceImpl extends BaseOpenmrsService implements St
         if (recordPrivilegeFilters == null || recordPrivilegeFilters.isEmpty())
             return new Result<>(new ArrayList<>(), 0);
         Result<StockItemTransactionDTO> result = dao.findStockItemTransactions(filter, recordPrivilegeFilters);
+        if (Boolean.TRUE.equals(filter == null ? null : filter.getIsPatientTransaction())) {
+            recordPatientStockTransactionView(result, "Viewed patient stock transaction history.");
+        }
         return result;
     }
 
@@ -2638,11 +3210,15 @@ public class StockManagementServiceImpl extends BaseOpenmrsService implements St
     }
 
     public List<OrderItem> getOrderItemsByOrder(Integer... orderIds) {
-        return dao.getOrderItemsByOrder(orderIds);
+        List<OrderItem> orderItems = dao.getOrderItemsByOrder(orderIds);
+        recordPatientOrderItemsView(orderItems, "order", "Viewed patient order-linked stock items.");
+        return orderItems;
     }
 
     public List<OrderItem> getOrderItemsByEncounter(Integer... encounterIds) {
-        return dao.getOrderItemsByEncounter(encounterIds);
+        List<OrderItem> orderItems = dao.getOrderItemsByEncounter(encounterIds);
+        recordPatientOrderItemsView(orderItems, "encounter", "Viewed patient encounter-linked stock items.");
+        return orderItems;
     }
 
     public Result<OrderItemDTO> findOrderItems(OrderItemSearchFilter filter) {
@@ -2650,14 +3226,24 @@ public class StockManagementServiceImpl extends BaseOpenmrsService implements St
                 Context.getAuthenticatedUser(), null, null, Privileges.TASK_STOCKMANAGEMENT_STOCKITEMS_DISPENSE_QTY);
         if (recordPrivilegeFilters == null || recordPrivilegeFilters.isEmpty())
             return new Result<>(new ArrayList<>(), 0);
-        return dao.findOrderItems(filter, recordPrivilegeFilters);
+        Result<OrderItemDTO> result = dao.findOrderItems(filter, recordPrivilegeFilters);
+        if (shouldAuditOrderItemSearch(filter)) {
+            recordPatientOrderItemSearchView(result, resolveOrderItemAccessPattern(filter),
+                    "Viewed patient-linked order items.");
+        }
+        return result;
     }
 
     public Result<OrderItemDTO> findOrderItems(OrderItemSearchFilter filter,
                                                HashSet<RecordPrivilegeFilter> recordPrivilegeFilters) {
         if (recordPrivilegeFilters != null && recordPrivilegeFilters.isEmpty())
             return new Result<>(new ArrayList<>(), 0);
-        return dao.findOrderItems(filter, recordPrivilegeFilters);
+        Result<OrderItemDTO> result = dao.findOrderItems(filter, recordPrivilegeFilters);
+        if (shouldAuditOrderItemSearch(filter)) {
+            recordPatientOrderItemSearchView(result, resolveOrderItemAccessPattern(filter),
+                    "Viewed patient-linked order items.");
+        }
+        return result;
     }
 
     public OrderItem saveOrderItem(OrderItem orderItem) {

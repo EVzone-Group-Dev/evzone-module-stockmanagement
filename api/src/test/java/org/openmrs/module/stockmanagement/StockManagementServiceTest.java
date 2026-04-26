@@ -655,6 +655,8 @@ public class StockManagementServiceTest extends BaseModuleContextSensitiveTest {
         dispenseRequest.setStockBatchUuid(stockBatch.getUuid());
         dispenseRequest.setStockItemPackagingUOMUuid(packagingUom.getUuid());
         stockManagementService.setDao(dao());
+        List<StockManagementServiceImpl.AuditEventData> events = new ArrayList<StockManagementServiceImpl.AuditEventData>();
+        stockManagementService.setAuditEventConsumer(events::add);
 
         stockManagementService.dispenseStockItems(dispenseRequests);
 
@@ -669,6 +671,12 @@ public class StockManagementServiceTest extends BaseModuleContextSensitiveTest {
                 .collect(Collectors.toList());
         assertEquals(entity.size(), 2);
         assertTrue(entity.stream().anyMatch(p -> dispenseRequests.stream().anyMatch(x -> p.getQuantity().multiply(BigDecimal.valueOf(-1)).setScale(2, BigDecimal.ROUND_HALF_EVEN).compareTo(x.getQuantity()) == 0)));
+        assertEquals(2, events.size());
+        assertTrue(events.stream().allMatch(event -> "MEDICATION_DISPENSED".equals(event.getEventCode())));
+        assertTrue(events.stream().allMatch(event -> "stockmanagement-api".equals(event.getSourceApp())));
+        assertTrue(events.stream().allMatch(event -> event.getContextItems().stream().anyMatch(
+            contextItem -> "patientUuid".equals(contextItem.getKey())
+                    && eu().getPatient().getUuid().equals(contextItem.getValue()))));
     }
 	
 	@Test
@@ -828,10 +836,17 @@ public class StockManagementServiceTest extends BaseModuleContextSensitiveTest {
 		//Given
 		OrderItem orderItem = eu().newOrderItem(dao(), stockItem, packagingUom);
 		dao().saveOrderItem(orderItem);
+		List<StockManagementServiceImpl.AuditEventData> events = new ArrayList<StockManagementServiceImpl.AuditEventData>();
+		stockManagementService.setAuditEventConsumer(events::add);
 		List<OrderItem> orderItems = stockManagementService.getOrderItemsByOrder(orderItem.getOrder().getId());
 		assertNotNull(orderItems);
 		assertEquals(orderItems.size(), 1);
 		assertEquals(orderItems.get(0).getUuid(), orderItem.getUuid());
+		assertEquals(1, events.size());
+		assertEquals("PATIENT_CHART_VIEWED", events.get(0).getEventCode());
+		assertTrue(events.get(0).getContextItems().stream().anyMatch(
+		    contextItem -> "patientUuid".equals(contextItem.getKey())
+		            && orderItem.getOrder().getPatient().getUuid().equals(contextItem.getValue())));
 	}
 	
 	@Test
@@ -846,11 +861,18 @@ public class StockManagementServiceTest extends BaseModuleContextSensitiveTest {
 		//Given
 		OrderItem orderItem = eu().newOrderItem(dao(), stockItem, packagingUom);
 		dao().saveOrderItem(orderItem);
+		List<StockManagementServiceImpl.AuditEventData> events = new ArrayList<StockManagementServiceImpl.AuditEventData>();
+		stockManagementService.setAuditEventConsumer(events::add);
 		List<OrderItem> orderItems = stockManagementService.getOrderItemsByEncounter(orderItem.getOrder().getEncounter()
 		        .getEncounterId());
 		assertNotNull(orderItems);
 		assertEquals(orderItems.size(), 1);
 		assertEquals(orderItems.get(0).getUuid(), orderItem.getUuid());
+		assertEquals(1, events.size());
+		assertEquals("PATIENT_CHART_VIEWED", events.get(0).getEventCode());
+		assertTrue(events.get(0).getContextItems().stream().anyMatch(
+		    contextItem -> "patientUuid".equals(contextItem.getKey())
+		            && orderItem.getOrder().getPatient().getUuid().equals(contextItem.getValue())));
 	}
 	
 	private void updateOrderScheduledDate(Order order, Date scheduledDate) {
@@ -1148,7 +1170,38 @@ public class StockManagementServiceTest extends BaseModuleContextSensitiveTest {
         result = stockManagementService.findOrderItems(filter, null);
         assertTrue(result.getData().isEmpty());
     }
-	
+
+	@Test
+	public void findOrderItems_shouldPublishAuditEventWhenFilteringByPatient() {
+		stockManagementService.setDao(dao());
+		StockItem stockItem = eu().newStockItem(dao(), false);
+		dao().saveStockItem(stockItem);
+		StockItemPackagingUOM packagingUom = eu().newStockItemPackagingUOM(dao(), false, stockItem);
+		dao().saveStockItemPackagingUOM(packagingUom);
+		Party party = eu().getParty(dao());
+		OrderItem orderItem = eu().newOrderItem(dao(), stockItem, packagingUom);
+		orderItem.setCreatedFrom(party.getLocation());
+		orderItem.setFulfilmentLocation(party.getLocation());
+		orderItem.setVoided(false);
+		dao().saveOrderItem(orderItem);
+
+		List<StockManagementServiceImpl.AuditEventData> events = new ArrayList<StockManagementServiceImpl.AuditEventData>();
+		stockManagementService.setAuditEventConsumer(events::add);
+
+		OrderItemSearchFilter filter = new OrderItemSearchFilter();
+		filter.setPatientIds(Arrays.asList(orderItem.getOrder().getPatient().getId()));
+
+		Result<OrderItemDTO> result = stockManagementService.findOrderItems(filter, null);
+		assertTrue(result.getData().stream().anyMatch(p -> p.getUuid().equalsIgnoreCase(orderItem.getUuid())));
+		assertEquals(1, events.size());
+		assertEquals("PATIENT_CHART_VIEWED", events.get(0).getEventCode());
+		assertTrue(events.get(0).getContextItems().stream().anyMatch(
+		    contextItem -> "patientUuid".equals(contextItem.getKey())
+		            && orderItem.getOrder().getPatient().getUuid().equals(contextItem.getValue())));
+		assertTrue(events.get(0).getContextItems().stream().anyMatch(
+		    contextItem -> "accessPattern".equals(contextItem.getKey()) && "patient-search".equals(contextItem.getValue())));
+	}
+
 	@Test
 	public void synchronizeTags() {
 		LocationTagsSynchronize locationTagsSynchronize = new LocationTagsSynchronize();
